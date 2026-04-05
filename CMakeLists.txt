@@ -62,6 +62,9 @@ target_compile_options(orderbook_lib_release PRIVATE
     ${WARN_FLAGS}
     -O3
     -march=native
+    # -mcx16 enables CMPXCHG16B on x86-64 for hardware lock-free 128-bit atomics.
+    # Uncomment on x86-64 Linux/Windows.  On ARM64 (Apple Silicon, Graviton),
+    # Clang handles 128-bit atomics natively; GCC requires -latomic (see below).
     -DNDEBUG
     -fno-omit-frame-pointer   # keeps perf/flamegraph stack traces readable
 )
@@ -80,6 +83,9 @@ target_compile_options(tests PRIVATE
     -fsanitize=address,undefined
 )
 target_link_options(tests PRIVATE -fsanitize=address,undefined)
+# -latomic: required on GCC/ARM64 for 128-bit std::atomic (LockFreePoolAllocator).
+# On x86-64 GCC with -mcx16, or Clang on any platform, this is not needed.
+target_link_libraries(tests PRIVATE atomic)
 
 # ---------------------------------------------------------------------------
 # Benchmark executable: release flags
@@ -87,10 +93,11 @@ target_link_options(tests PRIVATE -fsanitize=address,undefined)
 add_executable(bench
     bench/bench_main.cpp
 )
-target_link_libraries(bench PRIVATE orderbook_lib_release benchmark::benchmark benchmark::benchmark_main)
+target_link_libraries(bench PRIVATE orderbook_lib_release benchmark::benchmark benchmark::benchmark_main atomic)
 target_compile_options(bench PRIVATE
     -O3
     -march=native
+    -mcx16
     -DNDEBUG
     -fno-omit-frame-pointer
 )

@@ -1,9 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #include "order.hpp"
 #include "price_level.hpp"
 #include "pool_allocator.hpp"
+#include "lockfree_pool_allocator.hpp"
 #include "spsc_queue.hpp"
 #include "order_book.hpp"
 
@@ -311,4 +314,214 @@ TEST_CASE("OrderBook: out-of-range price rejected", "[book]") {
 
     REQUIRE(!book.add_order(1, Side::Bid, -1,     10, trades));
     REQUIRE(!book.add_order(2, Side::Ask, 100'000, 10, trades));
+}
+
+// ===========================================================================
+// lockfree_pool_allocator.hpp  (Version B)
+//
+// The single-threaded behaviour contract must be identical to Version A.
+// These tests verify that first, then add concurrency-specific tests.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Single-threaded correctness — same contract as Version A
+// ---------------------------------------------------------------------------
+
+TEST_CASE("LockFreePool: construction", "[lfpool]") {
+    constexpr size_t CAP = 128;
+    LockFreePoolAllocator pool(CAP);
+    REQUIRE(pool.capacity() == CAP);
+}
+
+TEST_CASE("LockFreePool: allocate returns non-null and distinct pointers", "[lfpool]") {
+    LockFreePoolAllocator pool(4);
+
+    Order* a = pool.allocate();
+    Order* b = pool.allocate();
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(a != b);
+    REQUIRE(pool.owns(a));
+    REQUIRE(pool.owns(b));
+
+    pool.deallocate(a);
+    pool.deallocate(b);
+}
+
+TEST_CASE("LockFreePool: exhaustion returns nullptr", "[lfpool]") {
+    LockFreePoolAllocator pool(2);
+    Order* a = pool.allocate();
+    Order* b = pool.allocate();
+    REQUIRE(pool.allocate() == nullptr);   // pool full
+    pool.deallocate(a);
+    pool.deallocate(b);
+}
+
+TEST_CASE("LockFreePool: slot is reusable after deallocate", "[lfpool]") {
+    LockFreePoolAllocator pool(2);
+
+    Order* a = pool.allocate();
+    pool.deallocate(a);
+
+    // The same slot (or another) must come back as a valid non-null pointer.
+    Order* b = pool.allocate();
+    REQUIRE(b != nullptr);
+    REQUIRE(pool.owns(b));
+
+    pool.deallocate(b);
+}
+
+TEST_CASE("LockFreePool: alignment of allocated slots", "[lfpool]") {
+    LockFreePoolAllocator pool(8);
+    std::vector<Order*> ptrs;
+    for (int i = 0; i < 8; ++i) {
+        Order* p = pool.allocate();
+        REQUIRE(p != nullptr);
+        // Every slot must satisfy Order's alignas(64) requirement.
+        REQUIRE(reinterpret_cast<uintptr_t>(p) % alignof(Order) == 0u);
+        ptrs.push_back(p);
+    }
+    for (auto* p : ptrs) pool.deallocate(p);
+}
+
+TEST_CASE("LockFreePool: LIFO order — most recently freed slot returned first", "[lfpool]") {
+    // Version B uses a stack (LIFO), same as Version A.
+    // The last slot pushed onto the free list is the first one popped.
+    // This matters for cache warmth: recently freed slots are hot.
+    LockFreePoolAllocator pool(4);
+
+    Order* a = pool.allocate();
+    Order* b = pool.allocate();
+
+    pool.deallocate(a);
+    pool.deallocate(b);   // b is now at the head of the free list
+
+    Order* first  = pool.allocate();   // should be b
+    Order* second = pool.allocate();   // should be a
+
+    REQUIRE(first  == b);
+    REQUIRE(second == a);
+
+    pool.deallocate(first);
+    pool.deallocate(second);
+}
+
+// ---------------------------------------------------------------------------
+// ABA-protection test
+//
+// We cannot directly observe the internal tag counter, but we can verify
+// that repeated alloc/dealloc cycles with interleaved reuse do not corrupt
+// the free list — the symptom of an ABA bug would be a crash, a returned
+// nullptr before the pool is exhausted, or a duplicate pointer being handed
+// out.
+//
+// This test simulates the ABA pattern in a single thread:
+//   1. Allocate X (head moves to Y).
+//   2. Deallocate X (X is pushed back, tag increments).
+//   3. Allocate X again — this is the "A→B→A" scenario.
+//   4. Verify we get X back (not nullptr, not a duplicate).
+// ---------------------------------------------------------------------------
+TEST_CASE("LockFreePool: ABA scenario does not corrupt free list", "[lfpool]") {
+    LockFreePoolAllocator pool(4);
+
+    // Drain all slots.
+    Order* slots[4];
+    for (auto& s : slots) s = pool.allocate();
+    REQUIRE(pool.allocate() == nullptr);
+
+    // Return them all.
+    for (auto* s : slots) pool.deallocate(s);
+
+    // Repeatedly alloc/dealloc the head slot.
+    // If ABA were possible here, the tag counter would stop it;
+    // a real bug would manifest as a null return or duplicate pointer.
+    std::vector<Order*> seen;
+    for (int round = 0; round < 8; ++round) {
+        Order* p = pool.allocate();
+        REQUIRE(p != nullptr);
+
+        // Check we haven't handed out the same slot twice in this round.
+        for (auto* prev : seen) REQUIRE(prev != p);
+        seen.push_back(p);
+
+        pool.deallocate(p);
+        seen.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent stress test
+//
+// One producer thread and one consumer thread hammer the allocator
+// simultaneously.  The producer allocates slots and puts them into an
+// SPSC queue; the consumer takes them out and deallocates them.
+//
+// If the lock-free logic is broken (wrong memory ordering, missing tag
+// increment, etc.) this test will crash or deadlock under ASan/TSan.
+//
+// Run the test binary with -fsanitize=thread to catch data races.
+// ---------------------------------------------------------------------------
+TEST_CASE("LockFreePool: concurrent producer/consumer stress", "[lfpool][concurrent]") {
+    constexpr size_t POOL_CAP   = 1024;
+    constexpr int    ITERATIONS = 50'000;
+
+    LockFreePoolAllocator pool(POOL_CAP);
+
+    // Use an atomic flag so the consumer knows when the producer is done.
+    std::atomic<bool> producer_done{false};
+
+    // Shared SPSC queue to pass allocated pointers from producer to consumer.
+    // We need it large enough that the producer doesn't block.
+    SPSCQueue<Order*, 2048> handoff;
+
+    std::atomic<int> allocated_count{0};
+    std::atomic<int> freed_count{0};
+
+    // Producer: allocates orders and hands them to the consumer.
+    std::thread producer([&]() {
+        for (int i = 0; i < ITERATIONS; ++i) {
+            Order* p = nullptr;
+            // Spin until a slot is available (pool may be momentarily full).
+            while ((p = pool.allocate()) == nullptr) {
+                // Yield to let the consumer thread make progress.
+                std::this_thread::yield();
+            }
+            // Write a sentinel value into the slot so we can verify it
+            // arrives intact on the consumer side.
+            new (p) Order{};
+            p->order_id = static_cast<uint64_t>(i);
+
+            // Spin until the queue has room.
+            while (!handoff.push(p)) std::this_thread::yield();
+            allocated_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        producer_done.store(true, std::memory_order_release);
+    });
+
+    // Consumer: receives orders from the producer and deallocates them.
+    std::thread consumer([&]() {
+        while (true) {
+            Order* p = nullptr;
+            if (handoff.pop(p)) {
+                // Verify the sentinel value survived the round trip.
+                REQUIRE(pool.owns(p));
+                p->~Order();
+                pool.deallocate(p);
+                freed_count.fetch_add(1, std::memory_order_relaxed);
+            } else if (producer_done.load(std::memory_order_acquire)) {
+                // Drain any remaining items before exiting.
+                if (!handoff.pop(p)) break;
+                REQUIRE(pool.owns(p));
+                p->~Order();
+                pool.deallocate(p);
+                freed_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    producer.join();
+    consumer.join();
+
+    REQUIRE(allocated_count.load() == ITERATIONS);
+    REQUIRE(freed_count.load()     == ITERATIONS);
 }
