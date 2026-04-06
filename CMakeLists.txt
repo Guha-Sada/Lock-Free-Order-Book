@@ -83,9 +83,6 @@ target_compile_options(tests PRIVATE
     -fsanitize=address,undefined
 )
 target_link_options(tests PRIVATE -fsanitize=address,undefined)
-# -latomic: required on GCC/ARM64 for 128-bit std::atomic (LockFreePoolAllocator).
-# On x86-64 GCC with -mcx16, or Clang on any platform, this is not needed.
-target_link_libraries(tests PRIVATE atomic)
 
 # ---------------------------------------------------------------------------
 # Benchmark executable: release flags
@@ -93,11 +90,20 @@ target_link_libraries(tests PRIVATE atomic)
 add_executable(bench
     bench/bench_main.cpp
 )
-target_link_libraries(bench PRIVATE orderbook_lib_release benchmark::benchmark benchmark::benchmark_main atomic)
+target_link_libraries(bench PRIVATE orderbook_lib_release benchmark::benchmark benchmark::benchmark_main)
 target_compile_options(bench PRIVATE
     -O3
     -march=native
-    -mcx16
     -DNDEBUG
     -fno-omit-frame-pointer
 )
+
+# ---------------------------------------------------------------------------
+# -latomic: GCC on Linux needs this for 128-bit std::atomic.
+# Apple Clang and Clang on Linux handle it natively — do not link it there
+# (the library doesn't exist on macOS and will cause a linker error).
+# ---------------------------------------------------------------------------
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_libraries(tests PRIVATE atomic)
+    target_link_libraries(bench PRIVATE atomic)
+endif()
