@@ -82,4 +82,4 @@ sudo cpupower frequency-set --governor powersave
 
 ## Work done by claude:
 
-Everything until this point, including the README, except for the Design decisions section. The decisions itself  were made by Claude. After each phase of the plan it created, I read the source code carefully and asked clarifying questions wherever I was confused. So, I add an explanation for these design decisions in my own words after reading the code even more.
+Everything until this point, including the README, except for the Design decisions section. The decisions itself  were made by Claude. After each phase of the plan it created, I read the source code carefully and asked clarifying questions wherever I was confused. So, I will add an explanation for these design decisions in my own words after reading the code even more.
