@@ -9,6 +9,7 @@
 #include "pool_allocator.hpp"
 #include "lockfree_pool_allocator.hpp"
 #include "spsc_queue.hpp"
+#include "naive_spsc_queue.hpp"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -224,27 +225,105 @@ static void BM_PoolAllocatorLF_Contended(benchmark::State& state) {
 BENCHMARK(BM_PoolAllocatorLF_Contended)->Unit(benchmark::kNanosecond);
 
 // ---------------------------------------------------------------------------
-// BM_SPSCQueue_WithPadding / WithoutPadding
+// SPSC Queue benchmark suite — three variants to tell the complete story
 //
-// Demonstrates the false-sharing penalty.  Phase 5 task: implement a
-// "NaiveSPSCQueue" that places head_ and tail_ on the same cache line, then
-// re-run this benchmark and add both results to the README.
+// 1. BM_SPSCQueue_Roundtrip        — single-threaded, padded queue
+// 2. BM_SPSCQueue_Throughput       — two-thread,      padded queue
+// 3. BM_NaiveSPSCQueue_Throughput  — two-thread,      naive (false-sharing)
+//
+// WHY THE SINGLE-THREADED BENCHMARK IS NOT ENOUGH:
+//   In BM_SPSCQueue_Roundtrip, both push() and pop() run on the same core.
+//   There is no second core to fight over the cache line, so false sharing
+//   cannot occur — write_pos_ and read_pos_ never bounce between cores.
+//   The padded and naive queues will show nearly identical numbers here.
+//
+//   The two-thread benchmarks (2 and 3) run producer and consumer on
+//   separate cores simultaneously.  Now false sharing is real: every push
+//   by the producer invalidates the consumer's cached copy of the cache
+//   line holding read_pos_, and vice versa.  The naive queue pays this
+//   penalty on every single operation.
+//
+// EXPECTED RESULTS (modern desktop CPU, 2 physical cores):
+//   BM_SPSCQueue_Roundtrip        ~5–10 ns/op   (same-core, no contention)
+//   BM_SPSCQueue_Throughput       ~8–15 ns/op   (cross-core, no false share)
+//   BM_NaiveSPSCQueue_Throughput  ~30–80 ns/op  (cross-core, false sharing)
+//
+//   The ratio between (2) and (3) is your empirical false-sharing penalty.
+//   Put both numbers in the README.
 // ---------------------------------------------------------------------------
+
+// 1. Single-threaded roundtrip — baseline, shows raw atomic op overhead
 static void BM_SPSCQueue_Roundtrip(benchmark::State& state) {
-    // Single-threaded round-trip (push + pop) to measure the raw overhead
-    // of the atomic operations and memory ordering.
     SPSCQueue<uint64_t, 4096> q;
     uint64_t val = 0;
 
     for (auto _ : state) {
-        q.push(val);
-        q.pop(val);
+        while (!q.push(val)) {}
+        while (!q.pop(val))  {}
         ++val;
     }
 
     state.SetItemsProcessed(state.iterations());
+    state.SetLabel("padded, single-threaded");
 }
 BENCHMARK(BM_SPSCQueue_Roundtrip)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// Two-thread throughput helper — used by both the padded and naive variants.
+//
+// The benchmark loop IS the producer.  A background consumer thread drains
+// the queue as fast as possible.  We measure how many items per second the
+// producer can push when a real consumer is competing on another core.
+//
+// The stop flag uses relaxed ordering for the poll loop (perf-critical) and
+// acquire/release for the final handshake (correctness-critical).
+// ---------------------------------------------------------------------------
+template<typename Queue>
+static void run_throughput_bench(benchmark::State& state, Queue& q) {
+    std::atomic<bool> stop{false};
+
+    std::thread consumer([&]() {
+        uint64_t val{};
+        while (!stop.load(std::memory_order_relaxed))
+            q.pop(val);
+        // Drain any remaining items after the producer signals stop.
+        while (q.pop(val)) {}
+    });
+
+    uint64_t val = 0;
+    for (auto _ : state) {
+        // Spin until the queue has room.  In a real system you would
+        // use a different backpressure strategy (drop, batch, etc.).
+        while (!q.push(val)) std::this_thread::yield();
+        benchmark::DoNotOptimize(val);
+        ++val;
+    }
+
+    stop.store(true, std::memory_order_release);
+    consumer.join();
+
+    state.SetItemsProcessed(state.iterations());
+}
+
+// 2. Padded queue — write_pos_ and read_pos_ on separate cache lines
+static void BM_SPSCQueue_Throughput(benchmark::State& state) {
+    SPSCQueue<uint64_t, 4096> q;
+    run_throughput_bench(state, q);
+    state.SetLabel("padded (no false sharing)");
+}
+BENCHMARK(BM_SPSCQueue_Throughput)->Unit(benchmark::kNanosecond);
+
+// 3. Naive queue — write_pos_ and read_pos_ on the SAME cache line
+//
+// This is the control: identical logic, identical memory ordering,
+// only difference is the missing alignas(64).  Any throughput gap
+// between this and BM_SPSCQueue_Throughput is purely false sharing.
+static void BM_NaiveSPSCQueue_Throughput(benchmark::State& state) {
+    NaiveSPSCQueue<uint64_t, 4096> q;
+    run_throughput_bench(state, q);
+    state.SetLabel("naive (false sharing)");
+}
+BENCHMARK(BM_NaiveSPSCQueue_Throughput)->Unit(benchmark::kNanosecond);
 
 // ---------------------------------------------------------------------------
 // BM_FullMatch: throughput of the match engine under continuous crossing flow
