@@ -316,6 +316,478 @@ TEST_CASE("OrderBook: out-of-range price rejected", "[book]") {
     REQUIRE(!book.add_order(2, Side::Ask, 100'000, 10, trades));
 }
 
+TEST_CASE("OrderBook: zero quantity rejected", "[book]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    REQUIRE(!book.add_order(1, Side::Bid, 100, 0, trades));
+    REQUIRE(book.order_count() == 0u);
+}
+
+// ===========================================================================
+// Phase 4 — comprehensive order book tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Helper: assert the pool-leak invariant.
+//
+// The number of slots the pool has handed out must always equal the number
+// of live orders in the book.  If these diverge, we either leaked an Order
+// (pool says slot is in-use but the book lost the pointer) or double-freed
+// one (pool says slot is free but the book still references it).
+//
+// This is the single most powerful correctness check in the suite.
+// ---------------------------------------------------------------------------
+static void check_pool_invariant(const OrderBook& book) {
+    // pool_available() + order_count() must equal pool capacity.
+    // Equivalently: pool_in_use == order_count.
+    // We check via the public accessor pool_available().
+    // pool capacity is DEFAULT_CAPACITY; in_use = capacity - available.
+    const size_t available = book.pool_available();
+    const size_t in_use    = PoolAllocator::DEFAULT_CAPACITY - available;
+    REQUIRE(in_use == book.order_count());
+}
+
+// ---------------------------------------------------------------------------
+// Time-priority (FIFO) matching
+//
+// Two orders rest at the same price.  An aggressor should fill the earlier
+// (head) order first, then the later (tail) order.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: time priority — earlier order filled first", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    // Two resting asks at the same price, added in order: id=1, then id=2.
+    book.add_order(1, Side::Ask, 100, 5, trades);
+    book.add_order(2, Side::Ask, 100, 5, trades);
+    REQUIRE(book.ask_qty_at(100) == 10u);
+
+    // Incoming bid large enough to fill both.
+    book.add_order(3, Side::Bid, 100, 10, trades);
+
+    REQUIRE(trades.size() == 2u);
+
+    // First trade must be against the earlier resting order (id=1).
+    REQUIRE(trades[0].passive_order_id == 1u);
+    REQUIRE(trades[0].quantity         == 5u);
+
+    // Second trade against the later one (id=2).
+    REQUIRE(trades[1].passive_order_id == 2u);
+    REQUIRE(trades[1].quantity         == 5u);
+
+    REQUIRE(book.order_count()    == 0u);
+    REQUIRE(book.best_ask()       == INVALID_PRICE);
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-level sweep
+//
+// An aggressor bid priced aggressively enough to consume orders across
+// multiple ask price levels in one shot.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: multi-level sweep — bid consumes three ask levels", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    // Three resting asks at different prices.
+    book.add_order(1, Side::Ask, 100, 10, trades);
+    book.add_order(2, Side::Ask, 101, 10, trades);
+    book.add_order(3, Side::Ask, 102, 10, trades);
+    REQUIRE(book.best_ask() == 100);
+
+    // Bid at 102 — crosses all three levels.
+    book.add_order(4, Side::Bid, 102, 30, trades);
+
+    REQUIRE(trades.size() == 3u);
+
+    // Fills happen at each passive level's price (passive price-priority).
+    REQUIRE(trades[0].price == 100);
+    REQUIRE(trades[1].price == 101);
+    REQUIRE(trades[2].price == 102);
+
+    REQUIRE(book.order_count() == 0u);
+    REQUIRE(book.best_ask()    == INVALID_PRICE);
+    REQUIRE(book.best_bid()    == INVALID_PRICE);
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Ask aggressor crossing the bid side
+//
+// All earlier matching tests used a bid as the aggressor.  This verifies
+// the symmetric ask-aggressor path through the match engine.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: ask aggressor fully matches resting bid", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Bid, 100, 10, trades);
+    REQUIRE(trades.empty());
+
+    book.add_order(2, Side::Ask, 100, 10, trades);
+
+    REQUIRE(trades.size() == 1u);
+    REQUIRE(trades[0].price               == 100);
+    REQUIRE(trades[0].quantity            == 10u);
+    REQUIRE(trades[0].aggressive_order_id == 2u);
+    REQUIRE(trades[0].passive_order_id    == 1u);
+
+    REQUIRE(book.order_count() == 0u);
+    REQUIRE(book.best_bid()    == INVALID_PRICE);
+    REQUIRE(book.best_ask()    == INVALID_PRICE);
+    check_pool_invariant(book);
+}
+
+TEST_CASE("OrderBook: ask aggressor sweeps multiple bid levels", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Bid, 100, 5, trades);
+    book.add_order(2, Side::Bid, 99,  5, trades);
+    book.add_order(3, Side::Bid, 98,  5, trades);
+    REQUIRE(book.best_bid() == 100);
+
+    // Ask priced at 98 — should sweep all three bid levels.
+    book.add_order(4, Side::Ask, 98, 15, trades);
+
+    REQUIRE(trades.size() == 3u);
+    REQUIRE(trades[0].price == 100);  // best bid first
+    REQUIRE(trades[1].price == 99);
+    REQUIRE(trades[2].price == 98);
+
+    REQUIRE(book.order_count() == 0u);
+    REQUIRE(book.best_bid()    == INVALID_PRICE);
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Partial fill leaving residual on the passive side
+//
+// Aggressor is smaller than the resting order.  The passive order should
+// remain at the head of the level with reduced quantity.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: partial fill — passive order retains residual at head", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    // Resting ask for 20.
+    book.add_order(1, Side::Ask, 100, 20, trades);
+
+    // Incoming bid for 7 — partially fills the ask.
+    book.add_order(2, Side::Bid, 100, 7, trades);
+
+    REQUIRE(trades.size()    == 1u);
+    REQUIRE(trades[0].quantity == 7u);
+
+    // Aggressor fully consumed (qty=7, no residual).
+    // Passive retains 13 units.
+    REQUIRE(book.order_count()    == 1u);   // only the passive remains
+    REQUIRE(book.ask_qty_at(100)  == 13u);
+    REQUIRE(book.best_ask()       == 100);
+    REQUIRE(book.best_bid()       == INVALID_PRICE);
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Cancel from the middle of a queue
+//
+// Three orders at the same price.  Cancel the middle one.
+// Verifies that the linked list stitches correctly: head→tail integrity
+// and the level's total_qty update.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: cancel middle order in queue", "[book][cancel]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Bid, 100, 10, trades);  // head
+    book.add_order(2, Side::Bid, 100, 20, trades);  // middle
+    book.add_order(3, Side::Bid, 100, 30, trades);  // tail
+
+    REQUIRE(book.bid_qty_at(100) == 60u);
+
+    // Cancel the middle order.
+    REQUIRE(book.cancel_order(2));
+
+    REQUIRE(book.order_count()   == 2u);
+    REQUIRE(book.bid_qty_at(100) == 40u);  // 10 + 30
+    REQUIRE(book.best_bid()      == 100);  // level still non-empty
+
+    // Verify time priority is preserved: a matching ask should fill id=1 first.
+    book.add_order(4, Side::Ask, 100, 10, trades);
+    REQUIRE(trades.size()              == 1u);
+    REQUIRE(trades[0].passive_order_id == 1u);
+
+    check_pool_invariant(book);
+}
+
+TEST_CASE("OrderBook: cancel head order in queue", "[book][cancel]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Ask, 100, 10, trades);  // head
+    book.add_order(2, Side::Ask, 100, 20, trades);  // tail
+
+    REQUIRE(book.cancel_order(1));
+    REQUIRE(book.ask_qty_at(100) == 20u);
+    REQUIRE(book.order_count()   == 1u);
+
+    // The remaining order (id=2) is now the head — it should match next.
+    book.add_order(3, Side::Bid, 100, 20, trades);
+    REQUIRE(trades.size()              == 1u);
+    REQUIRE(trades[0].passive_order_id == 2u);
+
+    check_pool_invariant(book);
+}
+
+TEST_CASE("OrderBook: cancel tail order in queue", "[book][cancel]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Bid, 100, 10, trades);  // head
+    book.add_order(2, Side::Bid, 100, 20, trades);  // tail
+
+    REQUIRE(book.cancel_order(2));
+    REQUIRE(book.bid_qty_at(100) == 10u);
+    REQUIRE(book.order_count()   == 1u);
+    REQUIRE(book.best_bid()      == 100);
+
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Cancel empties a non-best level (BBO should not change)
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: cancel non-best level does not change BBO", "[book][cancel]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Bid, 105, 10, trades);  // best bid
+    book.add_order(2, Side::Bid, 100, 10, trades);  // second level
+
+    REQUIRE(book.best_bid() == 105);
+    REQUIRE(book.cancel_order(2));         // cancel the non-best level
+    REQUIRE(book.best_bid() == 105);       // BBO unchanged
+    REQUIRE(book.order_count() == 1u);
+
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Modify then verify matching uses updated quantity
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: modify quantity reflected in subsequent match", "[book][modify]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    // Resting ask for 20.
+    book.add_order(1, Side::Ask, 100, 20, trades);
+    REQUIRE(book.ask_qty_at(100) == 20u);
+
+    // Reduce to 8.
+    REQUIRE(book.modify_order(1, 8));
+    REQUIRE(book.ask_qty_at(100) == 8u);
+
+    // Incoming bid for 8 — should fully consume the modified ask.
+    book.add_order(2, Side::Bid, 100, 8, trades);
+    REQUIRE(trades.size()    == 1u);
+    REQUIRE(trades[0].quantity == 8u);
+
+    REQUIRE(book.order_count() == 0u);
+    REQUIRE(book.best_ask()    == INVALID_PRICE);
+    check_pool_invariant(book);
+}
+
+TEST_CASE("OrderBook: modify to zero rejected", "[book][modify]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Bid, 100, 10, trades);
+    REQUIRE(!book.modify_order(1, 0));
+    REQUIRE(book.bid_qty_at(100) == 10u);
+}
+
+TEST_CASE("OrderBook: modify unknown order rejected", "[book][modify]") {
+    OrderBook book;
+    REQUIRE(!book.modify_order(999, 5));
+}
+
+// ---------------------------------------------------------------------------
+// BBO correctness after a sequence of operations
+//
+// Drives the book through a realistic sequence and checks BBO after each
+// step.  This is the closest thing to an integration test for the BBO
+// tracking logic.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: BBO tracking across a mixed operation sequence", "[book][bbo]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    // Build a bid ladder: 98, 99, 100.
+    book.add_order(1, Side::Bid, 100, 10, trades);
+    book.add_order(2, Side::Bid, 99,  10, trades);
+    book.add_order(3, Side::Bid, 98,  10, trades);
+    REQUIRE(book.best_bid() == 100);
+
+    // Build an ask ladder: 101, 102, 103.
+    book.add_order(4, Side::Ask, 101, 10, trades);
+    book.add_order(5, Side::Ask, 102, 10, trades);
+    book.add_order(6, Side::Ask, 103, 10, trades);
+    REQUIRE(book.best_ask() == 101);
+    REQUIRE(trades.empty());  // no cross yet
+
+    // Cancel the best bid — BBO should step down to 99.
+    book.cancel_order(1);
+    REQUIRE(book.best_bid() == 99);
+
+    // Cancel the best ask — BBO should step up to 102.
+    book.cancel_order(4);
+    REQUIRE(book.best_ask() == 102);
+
+    // Add a new best bid at 101 — crosses best ask at 102? No: 101 < 102.
+    book.add_order(7, Side::Bid, 101, 5, trades);
+    REQUIRE(trades.empty());
+    REQUIRE(book.best_bid() == 101);
+
+    // Add an ask at 101 — crosses best bid at 101.  Should match.
+    book.add_order(8, Side::Ask, 101, 5, trades);
+    REQUIRE(trades.size() == 1u);
+    REQUIRE(trades[0].quantity == 5u);
+
+    // Both sides of that trade consumed.
+    REQUIRE(book.best_bid() == 99);
+    REQUIRE(book.best_ask() == 102);
+
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Pool leak invariant across a high-volume sequence
+//
+// Runs 1 000 add/cancel pairs and asserts the pool invariant after every
+// operation.  Any leak or double-free shows up immediately.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: pool invariant holds across 1000 add/cancel cycles", "[book][pool]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    for (uint64_t i = 1; i <= 1000; ++i) {
+        // Spread orders across a range of prices so BBO scanning is exercised.
+        const int64_t price = static_cast<int64_t>(50'000 + (i % 100));
+        book.add_order(i, Side::Bid, price, 10, trades);
+        check_pool_invariant(book);
+    }
+
+    // Cancel them all in reverse order (exercises both head and non-head removal).
+    for (uint64_t i = 1000; i >= 1; --i) {
+        book.cancel_order(i);
+        check_pool_invariant(book);
+    }
+
+    REQUIRE(book.order_count() == 0u);
+    REQUIRE(book.best_bid()    == INVALID_PRICE);
+}
+
+// ---------------------------------------------------------------------------
+// Matching correctness: total_qty on the level stays consistent
+//
+// After partial matches and cancels, bid_qty_at() must always equal the
+// sum of leaves_qty across all resting orders at that level.
+// This catches any bug where total_qty is not updated correctly.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: level total_qty stays consistent under partial fills", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    // Three resting asks totalling 30.
+    book.add_order(1, Side::Ask, 100, 10, trades);
+    book.add_order(2, Side::Ask, 100, 10, trades);
+    book.add_order(3, Side::Ask, 100, 10, trades);
+    REQUIRE(book.ask_qty_at(100) == 30u);
+
+    // Partial fill of 7 — only the head order (id=1) is touched.
+    book.add_order(4, Side::Bid, 100, 7, trades);
+    REQUIRE(book.ask_qty_at(100) == 23u);  // 3 + 10 + 10
+
+    // Another partial fill of 5 — consumes the rest of id=1 (3) and 2 from id=2.
+    book.add_order(5, Side::Bid, 100, 5, trades);
+    REQUIRE(book.ask_qty_at(100) == 18u);  // 8 + 10
+
+    // Full fill of remaining: 18.
+    book.add_order(6, Side::Bid, 100, 18, trades);
+    REQUIRE(book.ask_qty_at(100) == 0u);
+    REQUIRE(book.best_ask()      == INVALID_PRICE);
+    REQUIRE(book.order_count()   == 0u);
+
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Aggressor that only partially fills, then rests
+//
+// Incoming order crosses a level, partially fills, then rests the residual.
+// Checks that the residual is correctly enqueued and visible.
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: aggressor partially fills then rests residual", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    // Resting ask for 5.
+    book.add_order(1, Side::Ask, 100, 5, trades);
+
+    // Incoming bid for 20 — fills 5, then rests 15 at 100.
+    book.add_order(2, Side::Bid, 100, 20, trades);
+
+    REQUIRE(trades.size()     == 1u);
+    REQUIRE(trades[0].quantity == 5u);
+
+    // Residual bid of 15 should be resting.
+    REQUIRE(book.order_count()    == 1u);
+    REQUIRE(book.best_bid()       == 100);
+    REQUIRE(book.bid_qty_at(100)  == 15u);
+    REQUIRE(book.best_ask()       == INVALID_PRICE);
+
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Edge prices: MIN and MAX tick boundaries
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: orders at MIN and MAX valid price ticks accepted", "[book][edge]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    REQUIRE(book.add_order(1, Side::Bid, OrderBook::MIN_PRICE_TICK, 1, trades));
+    REQUIRE(book.add_order(2, Side::Ask, OrderBook::MAX_PRICE_TICK, 1, trades));
+
+    REQUIRE(book.best_bid() == OrderBook::MIN_PRICE_TICK);
+    REQUIRE(book.best_ask() == OrderBook::MAX_PRICE_TICK);
+    REQUIRE(trades.empty());
+
+    check_pool_invariant(book);
+}
+
+// ---------------------------------------------------------------------------
+// Full match emitted as ask aggressor (symmetric to the bid aggressor test)
+// ---------------------------------------------------------------------------
+TEST_CASE("OrderBook: full match (ask aggressor)", "[book][match]") {
+    OrderBook book;
+    std::vector<Trade> trades;
+
+    book.add_order(1, Side::Bid, 200, 10, trades);
+    REQUIRE(trades.empty());
+
+    book.add_order(2, Side::Ask, 200, 10, trades);
+    REQUIRE(trades.size()              == 1u);
+    REQUIRE(trades[0].quantity         == 10u);
+    REQUIRE(trades[0].aggressive_order_id == 2u);
+    REQUIRE(trades[0].passive_order_id    == 1u);
+
+    REQUIRE(book.order_count() == 0u);
+    check_pool_invariant(book);
+}
+
 // ===========================================================================
 // lockfree_pool_allocator.hpp  (Version B)
 //
