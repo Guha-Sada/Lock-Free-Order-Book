@@ -704,38 +704,70 @@ BENCHMARK(BM_Latency_Match)->Unit(benchmark::kNanosecond);
 
 // ---- std::unordered_map baseline ----
 
-// Number of entries kept live in the map during the HashMap benchmarks.
-// 512 matches the order count of a moderately active book.  It also ensures
-// the map's working set (~512 * slot_size bytes) fits in L2 but not L1,
-// so cache behaviour is representative rather than pathologically hot.
-static constexpr uint64_t MAP_LIVE = 512;
+// ---------------------------------------------------------------------------
+// HashMap benchmark parameters
+//
+// MAP_BENCH_BATCH = 128:
+//   Larger than the general BENCH_BATCH=16 because isolated hash map ops
+//   are faster than full OrderBook ops.  With flat_find taking ~2 ns/op,
+//   we need 128 * 2 ns = 256 ns per batch to clear the 42 ns Apple Silicon
+//   timer floor with headroom (256 / 42 ≈ 6 ticks → floor ≈ 2 ns/op).
+//
+// MAP_LIVE = 8192:
+//   Enough entries that the unordered_map's heap nodes (8192 * ~48 bytes
+//   ≈ 393 KB) no longer fit in L1 data cache (typically 64–128 KB per
+//   core).  This creates genuine cache pressure: the hash bucket array is
+//   in L1 but the node pointer from the bucket leads to an L2/L3 access.
+//   FlatHashMap's array (8192 * 16 bytes = 128 KB) is larger but still
+//   contiguous, so a prefetcher can load ahead — sequential or linear-probe
+//   access costs one cache line per 4 slots, not one per slot.
+//
+// RANDOM KEY ACCESS:
+//   Sequential `(key + i) % MAP_LIVE` access is too predictable — both
+//   maps benefit equally from hardware prefetching.  A pre-shuffled key
+//   permutation defeats prefetching for unordered_map's scattered heap
+//   nodes (the prefetcher cannot predict a heap address from the key) while
+//   FlatHashMap's probing still stays within its contiguous slot array.
+//   This is the pattern a real order book sees: cancel requests arrive for
+//   arbitrary live orders, not in insertion order.
+// ---------------------------------------------------------------------------
+static constexpr int      MAP_BENCH_BATCH = 128;
+static constexpr uint64_t MAP_LIVE        = 8192;
+
+// Build a random permutation of [0, MAP_LIVE) once.  Used by both find
+// benchmarks so the access pattern is identical across implementations.
+static std::vector<uint64_t> make_random_keys() {
+    std::vector<uint64_t> keys(MAP_LIVE);
+    for (uint64_t i = 0; i < MAP_LIVE; ++i) keys[i] = i;
+    std::mt19937_64 rng(12345);
+    std::shuffle(keys.begin(), keys.end(), rng);
+    return keys;
+}
 
 static void BM_HashMap_Unordered_Insert(benchmark::State& state) {
     std::unordered_map<uint64_t, int> m;
-    m.reserve(1 << 17);
+    m.reserve(MAP_LIVE * 2);
     int val = 42;
 
-    // Pre-load MAP_LIVE entries so the map is in a realistic state.
     for (uint64_t k = 0; k < MAP_LIVE; ++k) m.emplace(k, val);
 
-    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
+    LatencyRecorder rec(4'000'000 / MAP_BENCH_BATCH + 1);
     uint64_t insert_key = MAP_LIVE;
-    uint64_t erase_key  = 0;       // erase oldest to maintain MAP_LIVE size
+    uint64_t erase_key  = 0;
 
     for (auto _ : state) {
         const int64_t t0 = now_ns();
-        for (int i = 0; i < BENCH_BATCH; ++i) {
+        for (int i = 0; i < MAP_BENCH_BATCH; ++i) {
             m.emplace(insert_key + i, val);
         }
         const int64_t t1 = now_ns();
         benchmark::DoNotOptimize(m.size());
 
-        // Erase old entries outside timed region — keeps map at MAP_LIVE.
-        for (int i = 0; i < BENCH_BATCH; ++i) m.erase(erase_key + i);
+        for (int i = 0; i < MAP_BENCH_BATCH; ++i) m.erase(erase_key + i);
 
-        rec.record((t1 - t0) / BENCH_BATCH);
-        insert_key += BENCH_BATCH;
-        erase_key  += BENCH_BATCH;
+        rec.record((t1 - t0) / MAP_BENCH_BATCH);
+        insert_key += MAP_BENCH_BATCH;
+        erase_key  += MAP_BENCH_BATCH;
     }
     rec.publish(state);
     state.SetItemsProcessed(state.iterations());
@@ -744,22 +776,24 @@ BENCHMARK(BM_HashMap_Unordered_Insert)->Unit(benchmark::kNanosecond);
 
 static void BM_HashMap_Unordered_Find(benchmark::State& state) {
     std::unordered_map<uint64_t, int> m;
-    m.reserve(1 << 17);
+    m.reserve(MAP_LIVE * 2);
     for (uint64_t k = 0; k < MAP_LIVE; ++k) m.emplace(k, static_cast<int>(k));
 
-    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
-    uint64_t key = 0;
+    // Random key permutation — defeats hardware prefetching for heap nodes.
+    const auto keys = make_random_keys();
+    LatencyRecorder rec(4'000'000 / MAP_BENCH_BATCH + 1);
+    size_t idx = 0;
 
     for (auto _ : state) {
         const int64_t t0 = now_ns();
-        for (int i = 0; i < BENCH_BATCH; ++i) {
-            auto it = m.find((key + i) % MAP_LIVE);
+        for (int i = 0; i < MAP_BENCH_BATCH; ++i) {
+            auto it = m.find(keys[(idx + i) % MAP_LIVE]);
             benchmark::DoNotOptimize(it);
         }
         const int64_t t1 = now_ns();
 
-        rec.record((t1 - t0) / BENCH_BATCH);
-        key += BENCH_BATCH;
+        rec.record((t1 - t0) / MAP_BENCH_BATCH);
+        idx += MAP_BENCH_BATCH;
     }
     rec.publish(state);
     state.SetItemsProcessed(state.iterations());
@@ -769,28 +803,29 @@ BENCHMARK(BM_HashMap_Unordered_Find)->Unit(benchmark::kNanosecond);
 // ---- FlatHashMap optimized ----
 
 static void BM_HashMap_Flat_Insert(benchmark::State& state) {
-    FlatHashMap<int> m(1 << 19);
+    // FlatHashMap capacity: 4× MAP_LIVE to keep load factor < 25%.
+    FlatHashMap<int> m(MAP_LIVE * 4);
     int val = 42;
 
     for (uint64_t k = 0; k < MAP_LIVE; ++k) m.insert(k, &val);
 
-    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
+    LatencyRecorder rec(4'000'000 / MAP_BENCH_BATCH + 1);
     uint64_t insert_key = MAP_LIVE;
     uint64_t erase_key  = 0;
 
     for (auto _ : state) {
         const int64_t t0 = now_ns();
-        for (int i = 0; i < BENCH_BATCH; ++i) {
+        for (int i = 0; i < MAP_BENCH_BATCH; ++i) {
             m.insert(insert_key + i, &val);
         }
         const int64_t t1 = now_ns();
         benchmark::DoNotOptimize(m.size());
 
-        for (int i = 0; i < BENCH_BATCH; ++i) m.erase(erase_key + i);
+        for (int i = 0; i < MAP_BENCH_BATCH; ++i) m.erase(erase_key + i);
 
-        rec.record((t1 - t0) / BENCH_BATCH);
-        insert_key += BENCH_BATCH;
-        erase_key  += BENCH_BATCH;
+        rec.record((t1 - t0) / MAP_BENCH_BATCH);
+        insert_key += MAP_BENCH_BATCH;
+        erase_key  += MAP_BENCH_BATCH;
     }
     rec.publish(state);
     state.SetItemsProcessed(state.iterations());
@@ -798,26 +833,29 @@ static void BM_HashMap_Flat_Insert(benchmark::State& state) {
 BENCHMARK(BM_HashMap_Flat_Insert)->Unit(benchmark::kNanosecond);
 
 static void BM_HashMap_Flat_Find(benchmark::State& state) {
-    FlatHashMap<int> m(1 << 19);
-    int arr[MAP_LIVE];
+    FlatHashMap<int> m(MAP_LIVE * 4);
+    std::vector<int> arr(MAP_LIVE);
     for (uint64_t k = 0; k < MAP_LIVE; ++k) {
         arr[k] = static_cast<int>(k);
         m.insert(k, &arr[k]);
     }
 
-    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
-    uint64_t key = 0;
+    // Same random permutation as the unordered_map find benchmark so the
+    // only variable is the data structure, not the access pattern.
+    const auto keys = make_random_keys();
+    LatencyRecorder rec(4'000'000 / MAP_BENCH_BATCH + 1);
+    size_t idx = 0;
 
     for (auto _ : state) {
         const int64_t t0 = now_ns();
-        for (int i = 0; i < BENCH_BATCH; ++i) {
-            int** p = m.find((key + i) % MAP_LIVE);
+        for (int i = 0; i < MAP_BENCH_BATCH; ++i) {
+            int** p = m.find(keys[(idx + i) % MAP_LIVE]);
             benchmark::DoNotOptimize(p);
         }
         const int64_t t1 = now_ns();
 
-        rec.record((t1 - t0) / BENCH_BATCH);
-        key += BENCH_BATCH;
+        rec.record((t1 - t0) / MAP_BENCH_BATCH);
+        idx += MAP_BENCH_BATCH;
     }
     rec.publish(state);
     state.SetItemsProcessed(state.iterations());
