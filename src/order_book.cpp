@@ -6,17 +6,37 @@
 #include <new>
 
 // ---------------------------------------------------------------------------
+// Helper: round up to the next power of two.
+// Used when sizing the FlatHashMap: we want 4× the pool capacity, rounded up
+// to a power of two (required by FlatHashMap's assertion).
+// ---------------------------------------------------------------------------
+static constexpr size_t next_pow2(size_t n) noexcept {
+    if (n == 0) return 1;
+    --n;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n |= n >> 32;
+    return n + 1;
+}
+
+// ---------------------------------------------------------------------------
 // Construction / Destruction
 // ---------------------------------------------------------------------------
 
 OrderBook::OrderBook(size_t pool_capacity)
     : bids_(std::make_unique<PriceLevel[]>(NUM_LEVELS))
     , asks_(std::make_unique<PriceLevel[]>(NUM_LEVELS))
+    // FlatHashMap capacity: 4× pool so load factor stays below 0.25 even
+    // with tombstone accumulation.  Sized as a power of two (required for
+    // the bitwise-AND modulo trick used by hash()).
+    , order_map_(next_pow2(pool_capacity * 4))
     , pool_(pool_capacity)
 {
-    // Zero-initialise every PriceLevel (head=nullptr, total_qty=0, etc.)
-    // make_unique value-initialises, so this is already done — but being
-    // explicit makes the intent clear to future readers.
+    // Initialise every PriceLevel: make_unique value-initialises, but we
+    // also explicitly set the price field so level_index lookups are correct.
     for (size_t i = 0; i < NUM_LEVELS; ++i) {
         bids_[i] = PriceLevel{};
         asks_[i] = PriceLevel{};
@@ -24,18 +44,17 @@ OrderBook::OrderBook(size_t pool_capacity)
         asks_[i].price = static_cast<int64_t>(i) + MIN_PRICE_TICK;
     }
 
-    // Reserve hash-map buckets upfront so early inserts don't rehash.
-    order_map_.reserve(pool_capacity);
+    // No reserve() needed — FlatHashMap is sized upfront in the constructor.
 }
 
 OrderBook::~OrderBook() {
-    // Destroy all live Order objects so their destructors run.
-    // (Order has a trivial destructor, but this is good practice.)
-    for (auto& [id, ptr] : order_map_) {
-        ptr->~Order();
-        pool_.deallocate(ptr);
-    }
-    order_map_.clear();
+    // Order is trivially destructible (no owned resources).
+    // pool_ owns all Order memory via its aligned_alloc block; when pool_'s
+    // destructor runs it calls std::free() on the whole block in one shot.
+    // No per-order cleanup is needed.
+    //
+    // order_map_ stores Order* pointers but does NOT own them — pool_ does.
+    // FlatHashMap's destructor (delete[] slots_) frees the slot array only.
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +132,7 @@ void OrderBook::match(Order* aggressor, std::vector<Trade>& trades_out) {
 
         const uint32_t filled = fill(aggressor, passive, trades_out);
 
-        // Update level's aggregate quantity directly (avoid recomputing).
+        // Update level's aggregate quantity directly (avoids recomputing total).
         assert(level.total_qty >= filled);
         level.total_qty -= filled;
 
@@ -125,18 +144,16 @@ void OrderBook::match(Order* aggressor, std::vector<Trade>& trades_out) {
             pool_.deallocate(passive);
 
             if (level.empty()) {
-                // Level is now empty — update best price.
                 if (is_bid)  update_best_ask_after_remove(match_price);
                 else         update_best_bid_after_remove(match_price);
             }
         }
-        // If passive is only partially filled it stays at the head (time-priority).
+        // Partially filled passive stays at the head (time-priority preserved).
     }
 }
 
 void OrderBook::update_best_bid_after_remove(int64_t removed_price) noexcept {
-    if (removed_price != best_bid_) return;  // best level wasn't touched
-    // Scan downward for the next non-empty bid level.
+    if (removed_price != best_bid_) return;
     for (int64_t p = best_bid_ - 1; p >= MIN_PRICE_TICK; --p) {
         if (!bids_[level_index(p)].empty()) {
             best_bid_ = p;
@@ -148,7 +165,6 @@ void OrderBook::update_best_bid_after_remove(int64_t removed_price) noexcept {
 
 void OrderBook::update_best_ask_after_remove(int64_t removed_price) noexcept {
     if (removed_price != best_ask_) return;
-    // Scan upward for the next non-empty ask level.
     for (int64_t p = best_ask_ + 1; p <= MAX_PRICE_TICK; ++p) {
         if (!asks_[level_index(p)].empty()) {
             best_ask_ = p;
@@ -166,15 +182,16 @@ bool OrderBook::add_order(uint64_t order_id, Side side, int64_t price,
                           uint32_t qty, std::vector<Trade>& trades_out) {
     if (!valid_price(price)) return false;
     if (qty == 0)            return false;
-    if (order_map_.count(order_id)) return false;  // duplicate id
+
+    // Duplicate check: FlatHashMap::find returns nullptr if not present.
+    if (order_map_.find(order_id) != nullptr) return false;
 
     Order* o = pool_.allocate();
     if (!o) [[unlikely]] return false;  // pool exhausted
 
-    // Placement-new to construct the Order in the pool slot.
     new (o) Order{
         .order_id     = order_id,
-        .timestamp_ns = 0,          // caller may set; omitted for brevity
+        .timestamp_ns = 0,
         .price        = price,
         .quantity     = qty,
         .filled_qty   = 0,
@@ -185,12 +202,11 @@ bool OrderBook::add_order(uint64_t order_id, Side side, int64_t price,
         ._reserved    = {},
     };
 
-    order_map_.emplace(order_id, o);
+    // FlatHashMap::insert(key, value) — O(1) amortised, no heap allocation.
+    order_map_.insert(order_id, o);
 
-    // Attempt matching first (aggressor semantics: cross if possible).
     match(o, trades_out);
 
-    // If any residual quantity remains, rest it on the book.
     if (leaves_qty(*o) > 0) {
         PriceLevel& level = (side == Side::Bid)
             ? bids_[level_index(price)]
@@ -198,7 +214,6 @@ bool OrderBook::add_order(uint64_t order_id, Side side, int64_t price,
 
         enqueue(level, o);
 
-        // Update best bid / ask.
         if (side == Side::Bid) {
             if (best_bid_ == INVALID_PRICE || price > best_bid_)
                 best_bid_ = price;
@@ -207,7 +222,7 @@ bool OrderBook::add_order(uint64_t order_id, Side side, int64_t price,
                 best_ask_ = price;
         }
     } else {
-        // Fully matched — no resting quantity; remove from map and pool.
+        // Fully matched — no resting quantity.
         order_map_.erase(order_id);
         o->~Order();
         pool_.deallocate(o);
@@ -221,11 +236,12 @@ bool OrderBook::add_order(uint64_t order_id, Side side, int64_t price,
 // ---------------------------------------------------------------------------
 
 bool OrderBook::cancel_order(uint64_t order_id) {
-    auto it = order_map_.find(order_id);
-    if (it == order_map_.end()) return false;
+    // find() returns Order** (pointer to the value slot), or nullptr.
+    Order** slot = order_map_.find(order_id);
+    if (!slot) return false;
 
-    Order* o = it->second;
-    order_map_.erase(it);
+    Order* o = *slot;
+    order_map_.erase(order_id);
 
     PriceLevel& level = (o->side == Side::Bid)
         ? bids_[level_index(o->price)]
@@ -248,16 +264,15 @@ bool OrderBook::cancel_order(uint64_t order_id) {
 // ---------------------------------------------------------------------------
 
 bool OrderBook::modify_order(uint64_t order_id, uint32_t new_qty) {
-    auto it = order_map_.find(order_id);
-    if (it == order_map_.end()) return false;
+    Order** slot = order_map_.find(order_id);
+    if (!slot) return false;
 
-    Order* o = it->second;
+    Order* o = *slot;
     const uint32_t current_leaves = leaves_qty(*o);
 
-    // Only reductions are supported (increase would require re-prioritising).
+    // Only reductions: increasing qty would require re-prioritising.
     if (new_qty == 0 || new_qty >= current_leaves) return false;
 
-    // Adjust the level's aggregate quantity.
     PriceLevel& level = (o->side == Side::Bid)
         ? bids_[level_index(o->price)]
         : asks_[level_index(o->price)];
@@ -266,9 +281,7 @@ bool OrderBook::modify_order(uint64_t order_id, uint32_t new_qty) {
     assert(level.total_qty >= reduction);
     level.total_qty -= reduction;
 
-    // Update the order in-place (no queue position change for reductions).
     o->quantity = o->filled_qty + new_qty;
-
     return true;
 }
 

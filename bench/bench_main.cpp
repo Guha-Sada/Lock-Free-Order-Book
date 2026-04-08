@@ -4,8 +4,11 @@
 #include <cstdint>
 #include <thread>
 #include <atomic>
+#include <unordered_map>
+#include <algorithm>   // nth_element used by LatencyRecorder (included here for clarity)
 
 #include "order_book.hpp"
+#include "flat_hash_map.hpp"
 #include "pool_allocator.hpp"
 #include "lockfree_pool_allocator.hpp"
 #include "spsc_queue.hpp"
@@ -400,12 +403,28 @@ BENCHMARK(BM_FullMatch)->Unit(benchmark::kNanosecond);
 
 // Returns current time in nanoseconds from a monotonic clock.
 // CLOCK_MONOTONIC_RAW: not adjusted by NTP — no backward jumps.
-// On Linux this is a VDSO call (kernel < 1 µs overhead).
+// On Linux x86/ARM servers this is a VDSO call with ~1 ns resolution.
+//
+// APPLE SILICON LIMITATION:
+//   On macOS ARM64, clock_gettime() reads cntvct_el0 — the ARM virtual
+//   counter — which ticks at 24 MHz (one tick every ~41.7 ns).
+//   Any operation faster than ~42 ns measures as 0 ns.
+//   The pmccntr_el0 CPU cycle counter has nanosecond resolution but
+//   requires root (EL0 access disabled by macOS by default).
+//
+//   FIX: batch timing via BENCH_BATCH below.  Time N operations per
+//   sample and divide by N.  With N=16 the floor drops to ~2.6 ns,
+//   well below any real operation we care to measure.
 static inline int64_t now_ns() noexcept {
     struct timespec ts{};
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
 }
+
+// Operations batched per timing sample.
+// Chosen so that (42 ns timer tick / BENCH_BATCH) ≈ 2.6 ns floor,
+// below the cost of any operation we benchmark.
+static constexpr int BENCH_BATCH = 16;
 
 // ---------------------------------------------------------------------------
 // LatencyRecorder
@@ -487,42 +506,41 @@ struct LatencyRecorder {
 static void BM_Latency_AddOrder(benchmark::State& state) {
     OrderBook book;
     std::vector<Trade> trades;
-    trades.reserve(4);
+    trades.reserve(BENCH_BATCH);
 
-    // Pre-populate bid side so best_bid_ is set and match() has a real
-    // price to check against.
     const int64_t MID = 50'000;
     for (int64_t p = MID - 100; p <= MID; ++p) {
         book.add_order(static_cast<uint64_t>(p), Side::Bid, p, 100, trades);
     }
 
-    // Estimate iteration count for pre-allocation.  Runs() * iterations()
-    // is not known ahead of time, so we use a generous upper bound.
-    // google/benchmark typically runs 1e6–1e9 iterations for fast functions;
-    // 4 million is enough for a ~1 µs function without wasting memory.
-    LatencyRecorder rec(4'000'000);
-
+    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
     uint64_t order_id = 2'000'000;
-    int64_t  price    = MID + 200;
 
     for (auto _ : state) {
         trades.clear();
 
+        // Time BENCH_BATCH add_orders in one shot, then divide.
+        // This beats the ~42 ns Apple Silicon timer floor.
         const int64_t t0 = now_ns();
-        book.add_order(order_id, Side::Ask, price, 10, trades);
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            book.add_order(order_id + i, Side::Ask,
+                           MID + 200 + static_cast<int64_t>((order_id + i) % 50),
+                           10, trades);
+        }
         const int64_t t1 = now_ns();
 
-        rec.record(t1 - t0);
+        rec.record((t1 - t0) / BENCH_BATCH);
 
-        // Clean up immediately so the book stays bounded.
-        book.cancel_order(order_id);
-        ++order_id;
-        price = MID + 200 + static_cast<int64_t>(order_id % 50);
+        // Cancel all — outside the timed region.
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            book.cancel_order(order_id + i);
+        }
+        order_id += BENCH_BATCH;
     }
 
     rec.publish(state);
     state.SetItemsProcessed(state.iterations());
-    state.SetLabel("add_order (no match)");
+    state.SetLabel("add_order (no match, batched x16)");
 }
 BENCHMARK(BM_Latency_AddOrder)->Unit(benchmark::kNanosecond);
 
@@ -543,22 +561,21 @@ BENCHMARK(BM_Latency_AddOrder)->Unit(benchmark::kNanosecond);
 // refill is excluded from measurement.
 // ---------------------------------------------------------------------------
 static void BM_Latency_Cancel(benchmark::State& state) {
-    constexpr int BATCH = 1024;
+    constexpr int FILL_SIZE = 1024;
     OrderBook book;
     std::vector<Trade> trades;
     trades.reserve(1);
 
-    auto prices = make_prices(BATCH, 50'000, 200);
-
+    auto prices = make_prices(FILL_SIZE, 50'000, 200);
     uint64_t next_id = 1;
     std::vector<uint64_t> live_ids;
-    live_ids.reserve(BATCH);
+    live_ids.reserve(FILL_SIZE);
 
     auto refill = [&]() {
-        for (int i = 0; i < BATCH; ++i) {
+        for (int i = 0; i < FILL_SIZE; ++i) {
             trades.clear();
             book.add_order(next_id, Side::Bid,
-                           prices[static_cast<size_t>(i) % BATCH],
+                           prices[static_cast<size_t>(i) % FILL_SIZE],
                            10, trades);
             live_ids.push_back(next_id++);
         }
@@ -566,27 +583,30 @@ static void BM_Latency_Cancel(benchmark::State& state) {
 
     refill();
     size_t idx = 0;
-
-    LatencyRecorder rec(4'000'000);
+    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
 
     for (auto _ : state) {
-        if (idx >= live_ids.size()) {
+        // Refill in multiples of BENCH_BATCH so we never straddle a refill
+        // boundary mid-batch.
+        if (idx + BENCH_BATCH > live_ids.size()) {
             live_ids.clear();
             refill();
             idx = 0;
         }
 
         const int64_t t0 = now_ns();
-        book.cancel_order(live_ids[idx]);
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            book.cancel_order(live_ids[idx + i]);
+        }
         const int64_t t1 = now_ns();
 
-        rec.record(t1 - t0);
-        ++idx;
+        rec.record((t1 - t0) / BENCH_BATCH);
+        idx += BENCH_BATCH;
     }
 
     rec.publish(state);
     state.SetItemsProcessed(state.iterations());
-    state.SetLabel("cancel_order");
+    state.SetLabel("cancel_order (batched x16)");
 }
 BENCHMARK(BM_Latency_Cancel)->Unit(benchmark::kNanosecond);
 
@@ -610,30 +630,198 @@ BENCHMARK(BM_Latency_Cancel)->Unit(benchmark::kNanosecond);
 static void BM_Latency_Match(benchmark::State& state) {
     OrderBook book;
     std::vector<Trade> trades;
-    trades.reserve(4);
+    trades.reserve(BENCH_BATCH);
 
     const int64_t MID = 50'000;
     uint64_t id = 1;
-
-    LatencyRecorder rec(4'000'000);
+    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
 
     for (auto _ : state) {
-        // Place a resting ask (not timed).
+        // Place BENCH_BATCH resting asks — NOT timed.
         trades.clear();
-        book.add_order(id++, Side::Ask, MID, 10, trades);
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            book.add_order(id++, Side::Ask, MID, 10, trades);
+        }
 
-        // Crossing bid — this is what we time.
+        // Time BENCH_BATCH crossing bids.
         trades.clear();
         const int64_t t0 = now_ns();
-        book.add_order(id++, Side::Bid, MID, 10, trades);
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            book.add_order(id++, Side::Bid, MID, 10, trades);
+        }
         const int64_t t1 = now_ns();
 
-        rec.record(t1 - t0);
+        rec.record((t1 - t0) / BENCH_BATCH);
         benchmark::DoNotOptimize(trades.data());
     }
 
     rec.publish(state);
     state.SetItemsProcessed(state.iterations());
-    state.SetLabel("full match (bid crosses ask)");
+    state.SetLabel("full match (bid crosses ask, batched x16)");
 }
 BENCHMARK(BM_Latency_Match)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// Phase 7 — HashMap Comparison: std::unordered_map vs FlatHashMap
+//
+// These benchmarks isolate exactly the access pattern that OrderBook uses:
+//   1. insert(id, ptr)   — on every add_order
+//   2. find(id)          — on cancel, modify, and duplicate-check
+//   3. erase(id)         — on cancel and fully-matched add
+//
+// They are NOT full OrderBook benchmarks — they only measure the cost of the
+// hash map operations themselves.  This makes the comparison clean: there is
+// no pool allocation, no linked-list manipulation, no price level scanning.
+// The ONLY variable is the hash map implementation.
+//
+// WHY std::unordered_map IS SLOWER AT p99/p999:
+//   std::unordered_map<K,V> is a node-based container.  Each insert()
+//   allocates a new heap node (malloc).  Each find() follows a pointer from
+//   the bucket array to the first node in the chain, then potentially follows
+//   more next-pointers if there are collisions.  Each of these pointer follows
+//   is a potential cache miss because the nodes are scattered across the heap.
+//
+//   Under steady-state order-book traffic (insert + erase cycling through the
+//   same address range), malloc's free-list reuses recently freed nodes, so
+//   the AVERAGE case looks fast.  But occasionally a node lands in a cold
+//   cache line and you pay the full ~100 ns LLC miss.  That is your p99 spike.
+//
+// WHY FlatHashMap IS FASTER:
+//   All slots are in a single contiguous array.  Linear probing means the CPU
+//   fetches neighbouring slots as part of the same cache line.  A 64-byte
+//   cache line holds 4 Slots (each 16 bytes), so a probe of 1-4 slots costs
+//   at most one cache line load.  No heap allocation on insert.  No pointer
+//   chasing.  p99 and p999 converge toward p50 because the variance source
+//   (heap pointer scatter) is gone.
+//
+// HOW TO READ THE NUMBERS:
+//   BM_HashMap_Unordered_*   — baseline (std::unordered_map)
+//   BM_HashMap_Flat_*        — optimized (FlatHashMap)
+//
+//   Compare p50_ns, p99_ns, p999_ns columns.
+//   A 2–5× improvement in p99/p999 with similar p50 is typical.
+// ---------------------------------------------------------------------------
+
+// ---- std::unordered_map baseline ----
+
+// Number of entries kept live in the map during the HashMap benchmarks.
+// 512 matches the order count of a moderately active book.  It also ensures
+// the map's working set (~512 * slot_size bytes) fits in L2 but not L1,
+// so cache behaviour is representative rather than pathologically hot.
+static constexpr uint64_t MAP_LIVE = 512;
+
+static void BM_HashMap_Unordered_Insert(benchmark::State& state) {
+    std::unordered_map<uint64_t, int> m;
+    m.reserve(1 << 17);
+    int val = 42;
+
+    // Pre-load MAP_LIVE entries so the map is in a realistic state.
+    for (uint64_t k = 0; k < MAP_LIVE; ++k) m.emplace(k, val);
+
+    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
+    uint64_t insert_key = MAP_LIVE;
+    uint64_t erase_key  = 0;       // erase oldest to maintain MAP_LIVE size
+
+    for (auto _ : state) {
+        const int64_t t0 = now_ns();
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            m.emplace(insert_key + i, val);
+        }
+        const int64_t t1 = now_ns();
+        benchmark::DoNotOptimize(m.size());
+
+        // Erase old entries outside timed region — keeps map at MAP_LIVE.
+        for (int i = 0; i < BENCH_BATCH; ++i) m.erase(erase_key + i);
+
+        rec.record((t1 - t0) / BENCH_BATCH);
+        insert_key += BENCH_BATCH;
+        erase_key  += BENCH_BATCH;
+    }
+    rec.publish(state);
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_HashMap_Unordered_Insert)->Unit(benchmark::kNanosecond);
+
+static void BM_HashMap_Unordered_Find(benchmark::State& state) {
+    std::unordered_map<uint64_t, int> m;
+    m.reserve(1 << 17);
+    for (uint64_t k = 0; k < MAP_LIVE; ++k) m.emplace(k, static_cast<int>(k));
+
+    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
+    uint64_t key = 0;
+
+    for (auto _ : state) {
+        const int64_t t0 = now_ns();
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            auto it = m.find((key + i) % MAP_LIVE);
+            benchmark::DoNotOptimize(it);
+        }
+        const int64_t t1 = now_ns();
+
+        rec.record((t1 - t0) / BENCH_BATCH);
+        key += BENCH_BATCH;
+    }
+    rec.publish(state);
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_HashMap_Unordered_Find)->Unit(benchmark::kNanosecond);
+
+// ---- FlatHashMap optimized ----
+
+static void BM_HashMap_Flat_Insert(benchmark::State& state) {
+    FlatHashMap<int> m(1 << 19);
+    int val = 42;
+
+    for (uint64_t k = 0; k < MAP_LIVE; ++k) m.insert(k, &val);
+
+    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
+    uint64_t insert_key = MAP_LIVE;
+    uint64_t erase_key  = 0;
+
+    for (auto _ : state) {
+        const int64_t t0 = now_ns();
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            m.insert(insert_key + i, &val);
+        }
+        const int64_t t1 = now_ns();
+        benchmark::DoNotOptimize(m.size());
+
+        for (int i = 0; i < BENCH_BATCH; ++i) m.erase(erase_key + i);
+
+        rec.record((t1 - t0) / BENCH_BATCH);
+        insert_key += BENCH_BATCH;
+        erase_key  += BENCH_BATCH;
+    }
+    rec.publish(state);
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_HashMap_Flat_Insert)->Unit(benchmark::kNanosecond);
+
+static void BM_HashMap_Flat_Find(benchmark::State& state) {
+    FlatHashMap<int> m(1 << 19);
+    int arr[MAP_LIVE];
+    for (uint64_t k = 0; k < MAP_LIVE; ++k) {
+        arr[k] = static_cast<int>(k);
+        m.insert(k, &arr[k]);
+    }
+
+    LatencyRecorder rec(4'000'000 / BENCH_BATCH + 1);
+    uint64_t key = 0;
+
+    for (auto _ : state) {
+        const int64_t t0 = now_ns();
+        for (int i = 0; i < BENCH_BATCH; ++i) {
+            int** p = m.find((key + i) % MAP_LIVE);
+            benchmark::DoNotOptimize(p);
+        }
+        const int64_t t1 = now_ns();
+
+        rec.record((t1 - t0) / BENCH_BATCH);
+        key += BENCH_BATCH;
+    }
+    rec.publish(state);
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_HashMap_Flat_Find)->Unit(benchmark::kNanosecond);
+
+BENCHMARK_MAIN();

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <array>
-#include <unordered_map>
 #include <vector>
 #include <cstdint>
 #include <optional>
@@ -9,6 +8,7 @@
 #include "order.hpp"
 #include "price_level.hpp"
 #include "pool_allocator.hpp"
+#include "flat_hash_map.hpp"
 
 // ---------------------------------------------------------------------------
 // OrderBook
@@ -35,9 +35,12 @@
 //   with no scan required.
 //
 // Order lookup:
-//   order_map_ (unordered_map<id, Order*>) provides O(1) amortised cancel
-//   and modify.  This map is *not* on the latency-critical add/match path;
-//   it is only accessed for cancel and modify, which are less frequent.
+//   order_map_ (FlatHashMap<Order>) provides O(1) amortised cancel and modify.
+//   This replaces std::unordered_map to eliminate node-based heap allocation
+//   and pointer chasing during collision resolution.  FlatHashMap uses open
+//   addressing with linear probing: all entries live in a single contiguous
+//   array, so the hardware prefetcher can load neighbouring slots speculatively
+//   and typical lookups complete with zero cache misses past L1.
 //
 // Memory:
 //   All Order objects are allocated from a PoolAllocator (no malloc on the
@@ -124,6 +127,9 @@ public:
     // Number of live orders currently in the book.
     size_t order_count() const noexcept { return order_map_.size(); }
 
+    // Hash map diagnostics.
+    size_t map_capacity() const noexcept { return order_map_.capacity(); }
+
     // Allocator diagnostics.
     size_t pool_available() const noexcept { return pool_.available(); }
 
@@ -171,7 +177,9 @@ private:
     std::unique_ptr<PriceLevel[]> asks_;   // indexed by price tick
 
     // O(1) order lookup for cancel / modify.
-    std::unordered_map<uint64_t, Order*> order_map_;
+    // FlatHashMap capacity is 4× the pool capacity to keep load factor < 0.25
+    // even accounting for tombstones, so probe sequences stay short.
+    FlatHashMap<Order> order_map_;
 
     // Pool allocator — all Order objects come from here.
     PoolAllocator pool_;
